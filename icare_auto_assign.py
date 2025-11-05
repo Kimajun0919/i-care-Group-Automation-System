@@ -5,7 +5,7 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
@@ -166,9 +166,10 @@ for idx, person in enumerate(TARGET_DATA, 1):
                 name_link = row.find_element(By.CSS_SELECTOR, "td a[name='nb']")
                 name_text = name_link.text.strip()
                 
-                # 연락처 추출 (마지막 td)
+                # 연락처 추출 (마지막 td 또는 010으로 시작하는 셀)
                 tds = row.find_elements(By.TAG_NAME, "td")
                 if len(tds) >= 8:
+                    # 마지막 td에서 연락처 추출 (인덱스 7 = 8번째 컬럼)
                     phone_text = tds[7].text.strip().replace("-", "").replace(" ", "")
                     
                     # 이름과 연락처가 일치하는지 확인
@@ -223,37 +224,72 @@ if selected_count > 0:
             log_progress(f"[{idx}/{len(TARGET_DATA)}] 배정 중: {person['name']} → {d_group} / {leader_name}", "progress")
             
             try:
-                # 다락방 선택
+                # 다락방 선택 (select 요소에서 option 선택)
                 log_progress(f"  다락방 선택: {d_group}", "info")
-                group_cell = wait.until(
-                    EC.element_to_be_clickable((By.XPATH, f"//td[contains(text(), '{d_group}')]"))
-                )
-                group_cell.click()
-                time.sleep(0.5)
-                log_progress(f"  다락방 선택 완료", "success")
+                dlb_select = wait.until(EC.presence_of_element_located((By.NAME, "dlb_nm")))
+                dlb_dropdown = Select(dlb_select)
                 
-                # 순장 선택
+                # option의 텍스트로 선택 시도
+                try:
+                    dlb_dropdown.select_by_visible_text(d_group)
+                    # 다락방 선택 시 soonlist 함수 호출하여 순 목록 업데이트
+                    # HTML에서 onclick="javascript:soonlist(this.selectedIndex)"이므로
+                    selected_index = [i for i, option in enumerate(dlb_select.find_elements(By.TAG_NAME, "option")) 
+                                     if option.text.strip() == d_group][0]
+                    driver.execute_script(f"soonlist({selected_index});", dlb_select)
+                    log_progress(f"  다락방 '{d_group}' 선택 완료 (인덱스: {selected_index})", "success")
+                except Exception as e:
+                    # 텍스트로 찾지 못하면 JavaScript로 직접 선택
+                    log_progress(f"  텍스트로 찾지 못함, JavaScript로 시도: {e}", "warning")
+                    selected_index = driver.execute_script(f"""
+                        var select = document.getElementsByName('dlb_nm')[0];
+                        for(var i = 0; i < select.options.length; i++) {{
+                            if(select.options[i].text === '{d_group}') {{
+                                select.selectedIndex = i;
+                                soonlist(i);
+                                return i;
+                            }}
+                        }}
+                        return -1;
+                    """)
+                    if selected_index == -1:
+                        log_progress(f"  다락방 '{d_group}'을 찾을 수 없습니다.", "error")
+                        continue
+                    time.sleep(1)  # 순 목록 업데이트 대기
+                    log_progress(f"  다락방 선택 완료 (JavaScript, 인덱스: {selected_index})", "success")
+                
+                # 순 목록이 업데이트될 때까지 대기 (JavaScript 실행 시간)
+                time.sleep(1.5)
+                
+                # 순장 선택 (select 요소에서 option 선택)
                 log_progress(f"  순장 선택: {leader_name}", "info")
-                leader_cell = wait.until(
-                    EC.element_to_be_clickable((By.XPATH, f"//td[contains(text(), '{leader_name}')]"))
-                )
-                leader_cell.click()
-                time.sleep(0.5)
-                log_progress(f"  순장 선택 완료", "success")
+                soon_select = wait.until(EC.presence_of_element_located((By.NAME, "soon_nm")))
+                soon_dropdown = Select(soon_select)
+                
+                try:
+                    soon_dropdown.select_by_visible_text(leader_name)
+                    log_progress(f"  순장 '{leader_name}' 선택 완료", "success")
+                except:
+                    log_progress(f"  순장 '{leader_name}'을 찾을 수 없습니다. 해당 다락방의 순 목록을 확인하세요.", "warning")
+                    continue
+                
+                # 순 저장 버튼 클릭 (순을 선택했으므로 순 저장 버튼 사용)
+                log_progress(f"  순 배정 저장 중...", "info")
+                soon_save_btn = wait.until(EC.element_to_be_clickable((By.ID, "btnsoon")))
+                soon_save_btn.click()
+                time.sleep(2)
+                log_progress(f"  배정 저장 완료: {person['name']} → {d_group} / {leader_name}", "success")
+                
+                # 팝업이 닫히고 다시 열릴 수 있으므로, 메인 페이지로 돌아가거나 다시 배정하기 버튼 클릭 필요
+                # 여러 명을 배정하는 경우, 팝업이 닫혔다가 다시 열려야 함
+                time.sleep(1)
                 
             except TimeoutException as e:
                 log_progress(f"  배정 실패: {e}", "error")
                 continue
-        
-        # 저장 버튼 클릭
-        try:
-            log_progress("저장 버튼 클릭 중...", "progress")
-            save_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@value='저장' or @type='submit']")))
-            save_btn.click()
-            time.sleep(2)
-            log_progress("저장 완료!", "success")
-        except TimeoutException:
-            log_progress("저장 버튼을 찾을 수 없습니다.", "warning")
+            except Exception as e:
+                log_progress(f"  배정 중 오류 발생: {e}", "error")
+                continue
             
     except Exception as e:
         log_progress(f"배정 과정 오류: {e}", "error")
