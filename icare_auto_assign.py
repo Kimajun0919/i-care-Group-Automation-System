@@ -38,7 +38,7 @@ def log_progress(message, status="info"):
 
 # CSV 파일에서 데이터 읽기
 def load_data_from_csv(filename="data.csv"):
-    """CSV 파일에서 다락방, 순장, 이름, 연락처 정보 읽기 (헤더 유연성 추가)"""
+    """CSV 파일에서 다락방, 순장, 이름, 연락처 정보 읽기 (헤더 유연성 추가, 동명이인 필터링)"""
     data_list = []
     try:
         with open(filename, "r", encoding="utf-8-sig") as f:  # BOM 처리
@@ -49,14 +49,44 @@ def load_data_from_csv(filename="data.csv"):
             header_map = {h.strip(): h for h in headers} if headers else {}
             
             for row in reader:
+                full_name = row.get(header_map.get("이름", "이름"), "").strip()
+                # 이름을 앞 세 글자만 사용
+                name_3chars = full_name[:3] if len(full_name) >= 3 else full_name
                 data_list.append({
                     "d_group": row.get(header_map.get("다락방", "다락방"), "").strip(),
                     "leader_name": row.get(header_map.get("순장", "순장"), "").strip(),
-                    "name": row.get(header_map.get("이름", "이름"), "").strip(),
+                    "name": name_3chars,
                     "phone": row.get(header_map.get("연락처", "연락처"), "").strip().replace("-", "").replace(" ", "")
                 })
-        log_progress(f"CSV 파일에서 {len(data_list)}명의 데이터 로드 완료", "success")
-        return data_list
+        
+        # 동명이인 필터링: 이름이 중복되는 항목들을 모두 제거
+        name_count = {}
+        for person in data_list:
+            name = person["name"]
+            if name:
+                name_count[name] = name_count.get(name, 0) + 1
+        
+        # 동명이인 제거
+        filtered_list = []
+        duplicate_names = set()
+        for person in data_list:
+            name = person["name"]
+            if name and name_count.get(name, 0) == 1:
+                filtered_list.append(person)
+            elif name and name_count.get(name, 0) > 1:
+                duplicate_names.add(name)
+        
+        if duplicate_names:
+            log_progress(f"CSV 데이터에서 동명이인 발견: {', '.join(sorted(duplicate_names))}", "warning")
+            log_progress(f"동명이인 {len(duplicate_names)}개 이름의 항목들을 제외합니다.", "info")
+        
+        removed_count = len(data_list) - len(filtered_list)
+        if removed_count > 0:
+            log_progress(f"동명이인 {removed_count}명 제외, {len(filtered_list)}명의 데이터 로드 완료", "success")
+        else:
+            log_progress(f"CSV 파일에서 {len(filtered_list)}명의 데이터 로드 완료", "success")
+        
+        return filtered_list
     except FileNotFoundError:
         log_progress(f"'{filename}' 파일을 찾을 수 없습니다.", "error")
         return []
@@ -219,7 +249,7 @@ for idx, person in enumerate(TARGET_DATA, 1):
         # ------------------------------------------
         # 6. 검색 및 선택
         # ------------------------------------------
-        log_progress(f"  검색 중: {name} ({phone})", "info")
+        log_progress(f"  검색 중: {name}", "info")
         
         # 검색 타입을 "이름"으로 설정
         select_key = wait.until(EC.presence_of_element_located((By.NAME, "select_key")))
@@ -235,7 +265,7 @@ for idx, person in enumerate(TARGET_DATA, 1):
         wait_and_click(driver, By.NAME, "btn_s_keyword")
         time.sleep(2)
         
-        # 검색 결과 테이블에서 이름과 연락처 일치하는 행 찾기
+        # 검색 결과 테이블에서 이름 일치하는 행 찾기
         table_rows = driver.find_elements(By.CSS_SELECTOR, "table tr.list_text, table tr.graycell")
         
         if not table_rows:
@@ -250,32 +280,57 @@ for idx, person in enumerate(TARGET_DATA, 1):
             failed_count += 1
             continue
         
-        found = False
+        # 이름이 일치하는 행들을 모두 찾기
+        matching_rows = []
         for row in table_rows:
             try:
                 # 이름 추출 (a 태그 내부)
                 name_link = row.find_element(By.CSS_SELECTOR, "td a[name='nb']")
                 name_text = name_link.text.strip()
+                # 검색 결과 이름도 앞 세 글자만 비교
+                name_text_3chars = name_text[:3] if len(name_text) >= 3 else name_text
                 
-                # 연락처 추출 (마지막 td)
-                tds = row.find_elements(By.TAG_NAME, "td")
-                if len(tds) >= 8:
-                    phone_text = tds[7].text.strip().replace("-", "").replace(" ", "")
-                    
-                    # 이름과 연락처가 일치하는지 확인
-                    if name_text == name and phone_text == phone:
-                        # 체크박스 선택
-                        checkbox = row.find_element(By.CSS_SELECTOR, "input[type='checkbox'][name='nb']")
-                        if not checkbox.is_selected():
-                            driver.execute_script("arguments[0].click();", checkbox)
-                            log_progress(f"  선택 완료: {name_text} / {phone_text}", "success")
-                            found = True
-                            break
+                # 이름이 일치하는 경우 (앞 세 글자 기준)
+                if name_text_3chars == name:
+                    matching_rows.append(row)
             except Exception:
                 continue
         
-        if not found:
-            log_progress(f"  일치하는 항목을 찾을 수 없습니다: {name} / {phone}", "warning")
+        # 동명이인 검증: 여러 명이 검색 결과에 나오면 입력하지 않음
+        if len(matching_rows) > 1:
+            log_progress(f"  동명이인 발견: {name} ({len(matching_rows)}명)", "warning")
+            failed_count += 1
+            failed_list.append({
+                "name": name,
+                "phone": phone,
+                "d_group": d_group,
+                "leader_name": leader_name,
+                "reason": f"동명이인 발견 ({len(matching_rows)}명)"
+            })
+            continue
+        
+        # 일치하는 항목이 하나인 경우
+        if len(matching_rows) == 1:
+            row = matching_rows[0]
+            try:
+                # 체크박스 선택
+                checkbox = row.find_element(By.CSS_SELECTOR, "input[type='checkbox'][name='nb']")
+                if not checkbox.is_selected():
+                    driver.execute_script("arguments[0].click();", checkbox)
+                    log_progress(f"  선택 완료: {name}", "success")
+            except Exception as e:
+                log_progress(f"  체크박스 선택 실패: {e}", "error")
+                failed_count += 1
+                failed_list.append({
+                    "name": name,
+                    "phone": phone,
+                    "d_group": d_group,
+                    "leader_name": leader_name,
+                    "reason": f"체크박스 선택 실패: {str(e)}"
+                })
+                continue
+        else:
+            log_progress(f"  일치하는 항목을 찾을 수 없습니다: {name}", "warning")
             failed_count += 1
             failed_list.append({
                 "name": name,
@@ -326,9 +381,16 @@ for idx, person in enumerate(TARGET_DATA, 1):
             if selected_index == -1:
                 log_progress(f"  다락방 '{d_group}'을 찾을 수 없습니다.", "error")
                 # 팝업 닫기 및 메인 페이지로 복귀
-                if len(driver.window_handles) > 1:
-                    driver.close()
-                    driver.switch_to.window(driver.window_handles[0])
+                try:
+                    current_handles = driver.window_handles
+                    if len(current_handles) > 1:
+                        driver.close()
+                        driver.switch_to.window(current_handles[0])
+                    else:
+                        if current_handles:
+                            driver.switch_to.window(current_handles[0])
+                except Exception as window_error:
+                    log_progress(f"  창 전환 중 오류 (무시): {window_error}", "warning")
                 failed_count += 1
                 failed_list.append({
                     "name": name,
@@ -355,9 +417,16 @@ for idx, person in enumerate(TARGET_DATA, 1):
             except:
                 log_progress(f"  순장 '{leader_name}'을 찾을 수 없습니다.", "warning")
                 # 팝업 닫기 및 메인 페이지로 복귀
-                if len(driver.window_handles) > 1:
-                    driver.close()
-                    driver.switch_to.window(driver.window_handles[0])
+                try:
+                    current_handles = driver.window_handles
+                    if len(current_handles) > 1:
+                        driver.close()
+                        driver.switch_to.window(current_handles[0])
+                    else:
+                        if current_handles:
+                            driver.switch_to.window(current_handles[0])
+                except Exception as window_error:
+                    log_progress(f"  창 전환 중 오류 (무시): {window_error}", "warning")
                 failed_count += 1
                 failed_list.append({
                     "name": name,
@@ -370,32 +439,95 @@ for idx, person in enumerate(TARGET_DATA, 1):
             
             # 저장 버튼 클릭
             log_progress(f"  순 배정 저장 중...", "info")
-            wait_and_click(driver, By.ID, "btnsoon")
-            time.sleep(1)
+            try:
+                wait_and_click(driver, By.ID, "btnsoon")
+            except Exception as click_error:
+                # 클릭 중 alert가 나타나면 먼저 처리
+                try:
+                    alert = driver.switch_to.alert
+                    alert_text = alert.text
+                    alert.accept()
+                    log_progress(f"  클릭 중 Alert 처리: {alert_text}", "info")
+                    time.sleep(0.5)
+                except:
+                    pass
+                # 클릭 재시도는 하지 않고 계속 진행
             
-            # alert 처리
-            alert_text = handle_alert(driver, accept=True)
-            if alert_text:
+            # alert 처리 (즉시 대기 및 처리)
+            time.sleep(0.5)  # alert가 나타날 시간을 줌
+            alert_text = None
+            try:
+                # alert가 나타날 때까지 짧은 대기
+                alert = WebDriverWait(driver, 3).until(EC.alert_is_present())
+                alert_text = alert.text
+                alert.accept()
                 log_progress(f"  Alert: {alert_text}", "info")
+                time.sleep(0.5)  # alert 처리 후 대기
+            except TimeoutException:
+                # alert가 없으면 그냥 진행
+                pass
+            except Exception as e:
+                # alert 처리 중 오류가 발생해도 계속 진행
+                log_progress(f"  Alert 처리 중 예외 (무시): {e}", "warning")
             
             time.sleep(1)
             log_progress(f"  배정 저장 완료: {name} → {d_group} / {leader_name}", "success")
             
             # 팝업 닫기 및 메인 페이지로 복귀
-            if len(driver.window_handles) > 1:
-                driver.close()
-                driver.switch_to.window(driver.window_handles[0])
-                time.sleep(1)  # 메인 페이지 로드 대기
-                log_progress(f"  메인 페이지로 복귀 완료", "success")
+            try:
+                # alert가 창을 닫았을 수 있으므로 먼저 확인
+                current_handles = driver.window_handles
+                if len(current_handles) > 1:
+                    # 현재 팝업 창이 아직 열려있음
+                    try:
+                        # 현재 창이 팝업인지 확인
+                        driver.switch_to.window(current_handles[-1])
+                        driver.close()
+                        # 메인 창으로 전환
+                        driver.switch_to.window(current_handles[0])
+                        time.sleep(1)  # 메인 페이지 로드 대기
+                        log_progress(f"  메인 페이지로 복귀 완료", "success")
+                    except Exception as close_error:
+                        # 창이 이미 닫혔을 수 있음
+                        log_progress(f"  팝업 창 닫기 중 오류 (이미 닫혔을 수 있음): {close_error}", "warning")
+                        try:
+                            if current_handles:
+                                driver.switch_to.window(current_handles[0])
+                                log_progress(f"  메인 페이지로 복귀 성공", "success")
+                        except:
+                            pass
+                else:
+                    # 팝업이 이미 닫혔거나 메인 창만 있는 경우
+                    if current_handles:
+                        driver.switch_to.window(current_handles[0])
+                    log_progress(f"  팝업이 이미 닫혔거나 메인 페이지에 있습니다.", "info")
+            except Exception as e:
+                # 창 전환 중 오류가 발생하면 메인 페이지로 이동 시도
+                log_progress(f"  창 전환 중 오류 (복구 시도): {e}", "warning")
+                try:
+                    main_handles = driver.window_handles
+                    if main_handles:
+                        driver.switch_to.window(main_handles[0])
+                        log_progress(f"  메인 페이지로 복귀 성공", "success")
+                except:
+                    pass
             
             processed_count += 1
             
         except TimeoutException as e:
             log_progress(f"  배정 실패: {e}", "error")
             # 팝업 닫기 및 메인 페이지로 복귀
-            if len(driver.window_handles) > 1:
-                driver.close()
-                driver.switch_to.window(driver.window_handles[0])
+            try:
+                current_handles = driver.window_handles
+                if len(current_handles) > 1:
+                    driver.close()
+                    driver.switch_to.window(current_handles[0])
+                else:
+                    # 메인 창으로 전환 시도
+                    if current_handles:
+                        driver.switch_to.window(current_handles[0])
+            except Exception as window_error:
+                log_progress(f"  창 전환 중 오류 (무시): {window_error}", "warning")
             failed_count += 1
             failed_list.append({
                 "name": name,
@@ -408,9 +540,17 @@ for idx, person in enumerate(TARGET_DATA, 1):
         except Exception as e:
             log_progress(f"  배정 중 오류 발생: {e}", "error")
             # 팝업 닫기 및 메인 페이지로 복귀
-            if len(driver.window_handles) > 1:
-                driver.close()
-                driver.switch_to.window(driver.window_handles[0])
+            try:
+                current_handles = driver.window_handles
+                if len(current_handles) > 1:
+                    driver.close()
+                    driver.switch_to.window(current_handles[0])
+                else:
+                    # 메인 창으로 전환 시도
+                    if current_handles:
+                        driver.switch_to.window(current_handles[0])
+            except Exception as window_error:
+                log_progress(f"  창 전환 중 오류 (무시): {window_error}", "warning")
             failed_count += 1
             failed_list.append({
                 "name": name,
@@ -433,11 +573,15 @@ for idx, person in enumerate(TARGET_DATA, 1):
         })
         # 메인 페이지로 복귀 시도
         try:
-            if len(driver.window_handles) > 1:
+            current_handles = driver.window_handles
+            if len(current_handles) > 1:
                 driver.close()
-                driver.switch_to.window(driver.window_handles[0])
-        except:
-            pass
+                driver.switch_to.window(current_handles[0])
+            else:
+                if current_handles:
+                    driver.switch_to.window(current_handles[0])
+        except Exception as window_error:
+            log_progress(f"  창 전환 중 오류 (무시): {window_error}", "warning")
         continue
 
 log_progress(f"\n총 {processed_count}명 처리 완료, {failed_count}명 실패", "success")
